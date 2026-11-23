@@ -15,6 +15,10 @@
       --border: #333338; --accent: #5b8ff0; --accent-text: #0d0d0f; --code-bg: #2a2a2e;
     }
   }
+  :root[data-theme="dark"] {
+    --bg: #161618; --panel: #1f1f22; --text: #ececee; --muted: #9a9aa1;
+    --border: #333338; --accent: #5b8ff0; --accent-text: #0d0d0f; --code-bg: #2a2a2e;
+  }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
     font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -302,7 +306,17 @@ $("copy").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText(md.value); setStatus("Copied to clipboard."); }
   catch { md.select(); document.execCommand("copy"); setStatus("Copied to clipboard."); }
 });
-$("download").addEventListener("click", () => {
+// Inside the Claude artifact viewer, saving goes through its downloads capability;
+// elsewhere (GitHub Pages, opened locally) a normal download link is used.
+const downloadsCap = window.claude?.use ? window.claude.use("downloads").catch(() => null) : Promise.resolve(null);
+$("download").addEventListener("click", async () => {
+  if (window.claude?.use) {
+    const dl = await downloadsCap;
+    if (!dl) { setStatus("Download isn't available here. Use Copy Markdown instead.", true); return; }
+    try { await dl.save({ filename: fileName + ".md", data: md.value }); setStatus("Saved."); }
+    catch (e) { if (e?.code !== "declined") setStatus("Could not save: " + (e?.message || e?.code || e), true); }
+    return;
+  }
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([md.value], { type: "text/markdown" }));
   a.download = fileName + ".md";
