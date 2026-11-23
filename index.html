@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF to Markdown</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70;
+    --border: #e2e2e0; --accent: #2f6fde; --accent-text: #ffffff; --code-bg: #f1f1ef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #161618; --panel: #1f1f22; --text: #ececee; --muted: #9a9aa1;
+      --border: #333338; --accent: #5b8ff0; --accent-text: #0d0d0f; --code-bg: #2a2a2e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  #drop { display: block; border: 2px dashed var(--border); border-radius: 12px; background: var(--panel);
+    padding: 32px 16px; text-align: center; cursor: pointer; transition: border-color .15s; }
+  #drop.over { border-color: var(--accent); }
+  #drop strong { color: var(--accent); }
+  #status { margin: 12px 0; color: var(--muted); min-height: 1.5em; }
+  #status.err { color: #d33; }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  button { font: inherit; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .panes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 760px) { .panes { grid-template-columns: 1fr; } }
+  .pane { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    display: flex; flex-direction: column; min-width: 0; }
+  .pane > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+    margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  textarea { flex: 1; min-height: 60vh; border: 0; resize: vertical; padding: 14px; background: transparent;
+    color: var(--text); font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; outline: none; }
+  #preview { padding: 4px 18px 18px; overflow: auto; max-height: 75vh; overflow-wrap: anywhere; }
+  #preview pre, #preview code { background: var(--code-bg); border-radius: 4px; }
+  #preview pre { padding: 10px; overflow: auto; }
+  .opts { color: var(--muted); font-size: 14px; display: flex; align-items: center; gap: 6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>PDF to Markdown</h1>
+  <p class="sub">Converts in your browser. Your file is never uploaded.</p>
+
+  <label id="drop">
+    <input id="file" type="file" accept="application/pdf,.pdf" hidden>
+    <div><strong>Choose a PDF</strong> or drag it here</div>
+  </label>
+  <div id="status"></div>
+
+  <div class="bar">
+    <button id="copy" class="primary" disabled>Copy Markdown</button>
+    <button id="download" disabled>Download .md</button>
+    <label class="opts"><input type="checkbox" id="pagebreaks"> Add page separators</label>
+  </div>
+
+  <div class="panes">
+    <section class="pane"><h2>Markdown</h2><textarea id="md" spellcheck="false" placeholder="Markdown appears here…"></textarea></section>
+    <section class="pane"><h2>Preview</h2><div id="preview"></div></section>
+  </div>
+</main>
+
+<script type="module">
+import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs";
+import { marked } from "https://cdn.jsdelivr.net/npm/marked@12.0.2/lib/marked.esm.js";
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs";
+
+const $ = (id) => document.getElementById(id);
+const md = $("md"), preview = $("preview"), status = $("status");
+let fileName = "document";
+let lastBuffer = null;
+
+function setStatus(msg, isErr = false) { status.textContent = msg; status.className = isErr ? "err" : ""; }
+function render() {
+  preview.innerHTML = marked.parse(md.value);
+  $("copy").disabled = $("download").disabled = !md.value.trim();
+}
+md.addEventListener("input", render);
+
+// ---------- PDF parsing ----------
+async function extractPages(pdf) {
+  const pages = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    setStatus(`Reading page ${p} of ${pdf.numPages}…`);
+    const page = await pdf.getPage(p);
+    const tc = await page.getTextContent();
+    // Load fonts so we can detect bold / italic / monospace from the real font names.
+    const fonts = {};
+    try {
+      await page.getOperatorList();
+      for (const it of tc.items) {
+        if (it.fontName && !(it.fontName in fonts)) {
+          try { const f = page.commonObjs.get(it.fontName); fonts[it.fontName] = (f && f.name) || ""; }
+          catch { fonts[it.fontName] = ""; }
+        }
+      }
+    } catch { /* fall back to no style info */ }
+
+    const items = [];
+    for (const it of tc.items) {
+      if (!("str" in it)) continue;
+      const [a, b, c, d, x, y] = it.transform;
+      const size = Math.round(Math.hypot(c, d) * 10) / 10 || it.height;
+      const fname = (fonts[it.fontName] || "") + " " + (tc.styles[it.fontName]?.fontFamily || "");
+      items.push({
+        str: it.str, x, y, w: it.width, size,
+        bold: /bold|black|heavy|semibold|demi/i.test(fname),
+        italic: /italic|oblique/i.test(fname),
+        mono: /mono|courier|consolas|menlo/i.test(fname),
+      });
+    }
+    pages.push(groupLines(items));
+  }
+  return pages;
+}
+
+// Group text items into visual lines (same baseline), left-to-right.
+function groupLines(items) {
+  items = items.filter((i) => i.str.length);
+  items.sort((p, q) => q.y - p.y || p.x - q.x);
+  const lines = [];
+  for (const it of items) {
+    const line = lines.find((l) => Math.abs(l.y - it.y) < Math.max(2, it.size * 0.4));
+    if (line) line.items.push(it); else lines.push({ y: it.y, items: [it] });
+  }
+  for (const l of lines) {
+    l.items.sort((p, q) => p.x - q.x);
+    l.x = l.items[0].x;
+    // Line font size = size covering most characters.
+    const bySize = {};
+    for (const i of l.items) if (i.str.trim()) bySize[i.size] = (bySize[i.size] || 0) + i.str.length;
+    l.size = +Object.entries(bySize).sort((p, q) => q[1] - p[1])[0]?.[0] || l.items[0].size;
+    const chars = l.items.filter((i) => i.str.trim());
+    l.bold = chars.length > 0 && chars.every((i) => i.bold);
+    l.mono = chars.length > 0 && chars.every((i) => i.mono);
+    l.text = joinItems(l.items, !l.bold);
+  }
+  lines.sort((p, q) => q.y - p.y);
+  return lines.filter((l) => l.text.trim());
+}
+
+// Join items, inserting spaces where there is a horizontal gap, and wrap bold/italic runs.
+function joinItems(items, allowInline) {
+  let out = "", prevEnd = null;
+  const runs = [];
+  for (const i of items) {
+    let s = i.str;
+    if (prevEnd !== null && i.x - prevEnd > i.size * 0.15 && !/\s$/.test(out) && !/^\s/.test(s)) s = " " + s;
+    out += s; prevEnd = i.x + i.w;
+    runs.push({ s, bold: i.bold, italic: i.italic });
+  }
+  if (!allowInline) return out;
+  // Rebuild with inline emphasis, merging adjacent runs with the same style.
+  let res = "", cur = null;
+  const flush = () => {
+    if (!cur) return;
+    const m = cur.s.match(/^(\s*)(.*?)(\s*)$/s);
+    let mark = cur.bold && cur.italic ? "***" : cur.bold ? "**" : cur.italic ? "*" : "";
+    res += m[2] && mark ? m[1] + mark + m[2] + mark + m[3] : cur.s;
+  };
+  for (const r of runs) {
+    if (cur && cur.bold === r.bold && cur.italic === r.italic) cur.s += r.s;
+    else { flush(); cur = { ...r }; }
+  }
+  flush();
+  return res;
+}
+
+function bodySize(pages) {
+  const count = {};
+  for (const lines of pages) for (const l of lines) count[l.size] = (count[l.size] || 0) + l.text.length;
+  return +Object.entries(count).sort((p, q) => q[1] - p[1])[0]?.[0] || 12;
+}
+
+// Text repeated on most pages at the top/bottom is a header or footer.
+function findRepeated(pages) {
+  if (pages.length < 3) return new Set();
+  const seen = {};
+  for (const lines of pages) {
+    const edge = new Set([...lines.slice(0, 2), ...lines.slice(-2)].map((l) => norm(l.text)));
+    for (const t of edge) seen[t] = (seen[t] || 0) + 1;
+  }
+  return new Set(Object.keys(seen).filter((t) => t && seen[t] >= pages.length * 0.6));
+}
+const norm = (t) => t.replace(/\d+/g, "#").replace(/\s+/g, " ").trim().toLowerCase();
+
+const BULLET = /^\s*([•●○◦▪■\-–*·])\s+/;
+const NUMBERED = /^\s*(\d{1,3}|[a-zA-Z])[.)]\s+/;
+
+function toMarkdown(pages, withBreaks) {
+  const body = bodySize(pages);
+  // Rank heading sizes: the biggest distinct sizes above body text become #, ##, ###.
+  const big = [...new Set(pages.flat().map((l) => l.size).filter((s) => s >= body * 1.15))].sort((a, b) => b - a);
+  const level = (s) => { const i = big.indexOf(s); return i < 0 ? 0 : Math.min(i + 1, 3); };
+  const repeated = findRepeated(pages);
+  const out = [];
+
+  pages.forEach((lines, pi) => {
+    if (withBreaks && pi > 0) out.push("---", `<!-- page ${pi + 1} -->`);
+    let para = null, code = null, list = null, prev = null;
+    const endList = () => { if (list) out.push(list.join("\n")); list = null; };
+    const endPara = () => {
+      if (para && para.list) { (list = list || []).push(para.text); }
+      else { endList(); if (para) out.push(para.text); }
+      para = null;
+    };
+    const endCode = () => {
+      if (!code) return;
+      const min = Math.min(...code.map((c) => c.x));
+      out.push("```\n" + code.map((c) => " ".repeat(Math.max(0, Math.round((c.x - min) / (c.size * 0.6)))) + c.text).join("\n") + "\n```");
+      code = null;
+    };
+    const leftMargin = Math.min(...lines.map((l) => l.x));
+
+    for (const l of lines) {
+      const text = l.text.trim();
+      if (repeated.has(norm(l.text)) || /^(page\s*)?\d{1,4}(\s*(of|\/)\s*\d+)?$/i.test(text)) { prev = l; continue; }
+      const gap = prev ? prev.y - l.y : 0;
+      const bigGap = prev && gap > Math.max(prev.size, l.size) * 1.6;
+
+      // Code blocks: monospace lines kept verbatim.
+      if (l.mono) {
+        endPara(); endList();
+        (code = code || []).push({ x: l.x, size: l.size, text: l.items.map((i) => i.str).join("") });
+        prev = l; continue;
+      }
+      endCode();
+
+      const lv = level(l.size);
+      const shortBold = l.bold && text.length < 80 && !/[.:,;]$/.test(text);
+      if (lv || (shortBold && (bigGap || !prev || !para))) {
+        endPara(); endList();
+        const h = lv || Math.min(big.length + 1, 4);
+        // Merge a heading that wraps onto two lines.
+        const last = out[out.length - 1];
+        if (prev && gap < l.size * 1.4 && last && last.startsWith("#".repeat(h) + " ") && prev.size === l.size)
+          out[out.length - 1] = last + " " + text;
+        else out.push("#".repeat(h) + " " + text.replace(/\*+/g, ""));
+        prev = l; continue;
+      }
+
+      if (BULLET.test(text) || NUMBERED.test(text)) {
+        endPara();
+        const indent = l.x - leftMargin > l.size * 1.5 ? "  " : "";
+        para = { list: true, text: BULLET.test(text) ? indent + "- " + text.replace(BULLET, "") : indent + text.replace(NUMBERED, (m, n) => `${n}. `) };
+        prev = l; continue;
+      }
+
+      if (para && !bigGap) {
+        // Continuation of current paragraph / list item; rejoin hyphenated words.
+        para.text = /[a-z]-$/.test(para.text) ? para.text.slice(0, -1) + text : para.text + " " + text;
+      } else { endPara(); para = { list: false, text }; }
+      prev = l;
+    }
+    endPara(); endList(); endCode();
+  });
+  return out.join("\n\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+}
+
+async function convert(buffer) {
+  try {
+    const pdf = await pdfjsLib.getDocument({ data: buffer.slice(0) }).promise;
+    const pages = await extractPages(pdf);
+    const result = toMarkdown(pages, $("pagebreaks").checked);
+    md.value = result;
+    render();
+    const chars = pages.flat().reduce((n, l) => n + l.text.length, 0);
+    if (chars < 20 * pdf.numPages)
+      setStatus(`Done, but very little text was found. This PDF is probably scanned images, which need OCR (not in this version).`, true);
+    else setStatus(`Converted ${pdf.numPages} page${pdf.numPages > 1 ? "s" : ""}.`);
+  } catch (e) {
+    console.error(e);
+    setStatus("Could not read this PDF: " + (e.message || e), true);
+  }
+}
+
+async function handle(file) {
+  if (!file) return;
+  fileName = file.name.replace(/\.pdf$/i, "") || "document";
+  setStatus("Loading…");
+  lastBuffer = await file.arrayBuffer();
+  convert(lastBuffer);
+}
+
+$("file").addEventListener("change", (e) => handle(e.target.files[0]));
+$("pagebreaks").addEventListener("change", () => lastBuffer && convert(lastBuffer));
+const drop = $("drop");
+["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", (e) => handle(e.dataTransfer.files[0]));
+
+$("copy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(md.value); setStatus("Copied to clipboard."); }
+  catch { md.select(); document.execCommand("copy"); setStatus("Copied to clipboard."); }
+});
+$("download").addEventListener("click", () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([md.value], { type: "text/markdown" }));
+  a.download = fileName + ".md";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+</script>
+</body>
+</html>
